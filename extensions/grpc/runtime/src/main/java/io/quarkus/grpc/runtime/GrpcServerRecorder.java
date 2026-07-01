@@ -42,12 +42,15 @@ import io.quarkus.runtime.ShutdownContext;
 import io.quarkus.runtime.annotations.Recorder;
 import io.quarkus.value.registry.ValueRegistry;
 import io.quarkus.vertx.http.runtime.QuarkusErrorHandler;
+import io.quarkus.vertx.http.runtime.options.HttpServerCommonHandlers;
 import io.quarkus.vertx.http.runtime.security.HttpAuthenticator;
 import io.quarkus.virtual.threads.VirtualThreadsRecorder;
 import io.smallrye.common.vertx.VertxContext;
 import io.vertx.core.Context;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
+import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.HttpServerConfig;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpVersion;
 import io.vertx.ext.web.Route;
@@ -80,7 +83,11 @@ public class GrpcServerRecorder {
     }
 
     public void addMainRouterErrorHandler(RuntimeValue<Router> mainRouter) {
-        mainRouter.getValue().route().last().failureHandler(new Handler<>() {
+        addGrpcErrorHandler(mainRouter.getValue());
+    }
+
+    private static void addGrpcErrorHandler(Router router) {
+        router.route().last().failureHandler(new Handler<>() {
 
             private final Handler<RoutingContext> errorHandler = new QuarkusErrorHandler(LaunchMode.current().isDevOrTest(),
                     false, Optional.empty());
@@ -117,6 +124,79 @@ public class GrpcServerRecorder {
 
         buildGrpcServer(vertx, configuration, routerSupplier, shutdown, blockingMethodsPerService, virtualMethodsPerService,
                 beanContainer.beanInstance(GrpcContainer.class), launchMode, securityPresent, securityHandlers);
+    }
+
+    /**
+     * Initializes the gRPC server on a dedicated network port, reusing the main Vert.x instance.
+     * <p>
+     * Unlike {@link #initializeGrpcServer}, the gRPC services are not attached to the main HTTP router. Instead, a
+     * dedicated {@link Router} is created on the same {@link Vertx} and bound to its own {@link HttpServer} listening
+     * on {@code quarkus.grpc.server.separate-port.port}. Because the {@code Vertx} instance is shared, the dedicated
+     * server reuses the existing event loops and worker thread pool — no separate event loop group is created.
+     */
+    public void initializeGrpcServerOnSeparatePort(boolean hasNoBindableServiceBeans, BeanContainer beanContainer,
+            RuntimeValue<Vertx> vertxSupplier,
+            ShutdownContext shutdown,
+            Map<String, List<String>> blockingMethodsPerService,
+            Map<String, List<String>> virtualMethodsPerService,
+            LaunchMode launchMode, boolean securityPresent, Map<Integer, Handler<RoutingContext>> securityHandlers) {
+        if (hasNoBindableServiceBeans && LaunchMode.current() != LaunchMode.DEVELOPMENT) {
+            LOGGER.error("Unable to find beans exposing the `BindableService` interface - not starting the gRPC server");
+            return;
+        }
+
+        Vertx vertx = vertxSupplier.getValue();
+        GrpcServerConfiguration configuration = runtimeConfig.getValue().server();
+        GrpcServerConfiguration.SeparatePortConfig separatePort = configuration.separatePort();
+        int port = launchMode == LaunchMode.TEST ? separatePort.testPort() : separatePort.port();
+        String host = separatePort.host();
+
+        // A dedicated router so the gRPC routes are not mixed with the main HTTP router; it shares the main Vert.x.
+        Router grpcRouter = Router.router(vertx);
+        if (securityPresent) {
+            // The dedicated router does not have the QuarkusErrorHandler the main router relies on, so add it here
+            // to make sure exceptions raised during proactive authentication or HTTP authorization are handled.
+            addGrpcErrorHandler(grpcRouter);
+        }
+        buildGrpcServer(vertx, configuration, new RuntimeValue<>(grpcRouter), shutdown, blockingMethodsPerService,
+                virtualMethodsPerService, beanContainer.beanInstance(GrpcContainer.class), launchMode, securityPresent,
+                securityHandlers);
+
+        // gRPC requires HTTP/2. The default HttpServerConfig only enables HTTP/1.1, so HTTP/2 has to be enabled
+        // explicitly (this also enables HTTP/2 cleartext / h2c, used by plaintext gRPC).
+        HttpServerConfig options = new HttpServerConfig()
+                .setHost(host)
+                .setPort(port)
+                .setVersions(HttpVersion.HTTP_1_1, HttpVersion.HTTP_2);
+
+        // Mirror the main HTTP server's request pipeline (see VertxHttpRecorder.ACTUAL_ROOT):
+        // 1. Pause the request before the router runs so that, while the (possibly async/blocking) security
+        //    filters execute, inbound HTTP/2 DATA frames are not read and lost before the gRPC deframer installs
+        //    its read handler.
+        // 2. Enforce a duplicated context and wrap the request in a ResumingRequestWrapper, whose handler(...)
+        //    override resumes the request once the deframer attaches its read handler.
+        // Without this, secured gRPC calls on the dedicated router fail with "Request has already been read".
+        Handler<HttpServerRequest> grpcRequestHandler = HttpServerCommonHandlers.enforceDuplicatedContext(grpcRouter, true);
+        Handler<HttpServerRequest> rootHandler = new Handler<HttpServerRequest>() {
+            @Override
+            public void handle(HttpServerRequest request) {
+                if (!request.isEnded()) {
+                    request.pause();
+                }
+                grpcRequestHandler.handle(request);
+            }
+        };
+
+        HttpServer server = vertx.createHttpServer(options).requestHandler(rootHandler);
+        server.listen(port, host).onComplete(ar -> {
+            if (ar.succeeded()) {
+                LOGGER.infof("gRPC server listening on %s:%d (separate port, sharing the main Vert.x event loops)",
+                        host, ar.result().actualPort());
+            } else {
+                LOGGER.errorf(ar.cause(), "Unable to start the gRPC server on %s:%d", host, port);
+            }
+        });
+        shutdown.addShutdownTask(() -> server.close());
     }
 
     // TODO -- handle XDS

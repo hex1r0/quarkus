@@ -879,6 +879,7 @@ public class GrpcServerProcessor {
     @Consume(SyntheticBeansRuntimeInitBuildItem.class)
     ServiceStartBuildItem initializeServer(GrpcServerRecorder recorder,
             GrpcBuildTimeConfig buildTimeConfig,
+            GrpcServerBuildTimeConfig serverBuildTimeConfig,
             ShutdownContextBuildItem shutdown,
             List<BindableServiceBuildItem> bindables,
             List<RecorderBeanInitializedBuildItem> orderEnforcer,
@@ -905,24 +906,6 @@ public class GrpcServerProcessor {
 
         if (!bindables.isEmpty()
                 || (LaunchMode.current() == LaunchMode.DEVELOPMENT && buildTimeConfig.devMode().forceServerStart())) {
-            //Uses mainrouter when the 'quarkus.http.root-path' is not '/'
-            Map<Integer, Handler<RoutingContext>> securityHandlers = null;
-            final RuntimeValue<Router> routerRuntimeValue;
-            if (routerBuildItem.getMainRouter() != null) {
-                routerRuntimeValue = routerBuildItem.getMainRouter();
-                if (capabilities.isPresent(Capability.SECURITY)) {
-                    securityHandlers = filterBuildItems
-                            .stream()
-                            .filter(filter -> filter.getPriority() == SecurityHandlerPriorities.AUTHENTICATION
-                                    || filter.getPriority() == SecurityHandlerPriorities.AUTHORIZATION)
-                            .collect(Collectors.toMap(f -> f.getPriority() * -1, FilterBuildItem::getHandler));
-                    // for the moment being, the main router doesn't have QuarkusErrorHandler, but we need to make
-                    // sure that exceptions raised during proactive authentication or HTTP authorization are handled
-                    recorder.addMainRouterErrorHandler(routerRuntimeValue);
-                }
-            } else {
-                routerRuntimeValue = routerBuildItem.getHttpRouter();
-            }
             Type bindableServiceType = Type.create(GrpcDotNames.BINDABLE_SERVICE, org.jboss.jandex.Type.Kind.CLASS);
             BeanStream bindableServiceBeanStream = validationPhase.getContext().beans().classBeans()
                     .matchBeanTypes(new Predicate<>() {
@@ -931,6 +914,35 @@ public class GrpcServerProcessor {
                             return types.contains(bindableServiceType);
                         }
                     });
+
+            if (serverBuildTimeConfig.separatePort().enabled()) {
+                // gRPC runs on its own TCP listener but reuses the main Vert.x instance (shared event loops).
+                // The dedicated router does not carry the main HTTP server's security filters, so the
+                // authentication/authorization handlers are always collected here and attached to it.
+                boolean securityPresent = capabilities.isPresent(Capability.SECURITY);
+                Map<Integer, Handler<RoutingContext>> securityHandlers = securityPresent
+                        ? collectSecurityHandlers(filterBuildItems)
+                        : null;
+                recorder.initializeGrpcServerOnSeparatePort(bindableServiceBeanStream.isEmpty(),
+                        beanContainerBuildItem.getValue(), vertx.getVertx(), shutdown, blocking, virtuals,
+                        launchModeBuildItem.getLaunchMode(), securityPresent, securityHandlers);
+                return new ServiceStartBuildItem(GRPC_SERVER);
+            }
+
+            //Uses mainrouter when the 'quarkus.http.root-path' is not '/'
+            Map<Integer, Handler<RoutingContext>> securityHandlers = null;
+            final RuntimeValue<Router> routerRuntimeValue;
+            if (routerBuildItem.getMainRouter() != null) {
+                routerRuntimeValue = routerBuildItem.getMainRouter();
+                if (capabilities.isPresent(Capability.SECURITY)) {
+                    securityHandlers = collectSecurityHandlers(filterBuildItems);
+                    // for the moment being, the main router doesn't have QuarkusErrorHandler, but we need to make
+                    // sure that exceptions raised during proactive authentication or HTTP authorization are handled
+                    recorder.addMainRouterErrorHandler(routerRuntimeValue);
+                }
+            } else {
+                routerRuntimeValue = routerBuildItem.getHttpRouter();
+            }
             recorder.initializeGrpcServer(bindableServiceBeanStream.isEmpty(), beanContainerBuildItem.getValue(),
                     vertx.getVertx(), routerRuntimeValue,
                     shutdown, blocking, virtuals, launchModeBuildItem.getLaunchMode(),
@@ -938,6 +950,14 @@ public class GrpcServerProcessor {
             return new ServiceStartBuildItem(GRPC_SERVER);
         }
         return null;
+    }
+
+    private static Map<Integer, Handler<RoutingContext>> collectSecurityHandlers(List<FilterBuildItem> filterBuildItems) {
+        return filterBuildItems
+                .stream()
+                .filter(filter -> filter.getPriority() == SecurityHandlerPriorities.AUTHENTICATION
+                        || filter.getPriority() == SecurityHandlerPriorities.AUTHORIZATION)
+                .collect(Collectors.toMap(f -> f.getPriority() * -1, FilterBuildItem::getHandler));
     }
 
     @BuildStep

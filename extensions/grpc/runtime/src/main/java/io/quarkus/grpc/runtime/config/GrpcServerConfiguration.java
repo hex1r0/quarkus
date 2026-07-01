@@ -26,4 +26,38 @@ public interface GrpcServerConfiguration {
      * gRPC compression, e.g. "gzip"
      */
     Optional<String> compression();
+
+    /**
+     * Runtime configuration of the separate gRPC server port.
+     * <p>
+     * Only used when {@code quarkus.grpc.server.separate-port.enabled} is {@code true}. When the gRPC server
+     * is multiplexed on the main HTTP server (the default), these settings are ignored and the gRPC server
+     * listens on {@code quarkus.http.port}.
+     */
+    SeparatePortConfig separatePort();
+
+    @ConfigGroup
+    interface SeparatePortConfig {
+        /**
+         * The port the separate gRPC server is bound to.
+         * <p>
+         * Defaults to {@code 9000}, matching the port used by the previous standalone gRPC server. Note that the
+         * management interface also defaults to {@code 9000}/{@code 9001}, so if both are enabled, configure a
+         * different port for one of them to avoid a clash.
+         */
+        @WithDefault("9000")
+        int port();
+
+        /**
+         * The port the separate gRPC server is bound to in test mode.
+         */
+        @WithDefault("9001")
+        int testPort();
+
+        /**
+         * The host the separate gRPC server is bound to.
+         */
+        @WithDefault("0.0.0.0")
+        String host();
+    }
 }
