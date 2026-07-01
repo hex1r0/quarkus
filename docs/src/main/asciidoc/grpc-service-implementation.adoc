@@ -223,6 +223,65 @@ Also, most of the other configuration properties are no longer applied, since it
 
 IMPORTANT: When you enable `quarkus.grpc.server.xds.enabled`, it's the xDS that should handle most of the configuration above.
 
+[[separate-port]]
+=== Running the gRPC server on a separate port
+
+By default, the gRPC server is multiplexed on the main Quarkus HTTP server, so gRPC and HTTP/REST share the same
+port (`quarkus.http.port`, `8080` by default) over HTTP/2.
+
+If you need gRPC to listen on a *different* port than HTTP (for example `8080` for REST and `9000` for gRPC), enable
+the separate port mode:
+
+[source,properties]
+----
+quarkus.grpc.server.separate-port.enabled=true
+quarkus.grpc.server.separate-port.port=9000
+----
+
+The default port is `9000` (and `9001` in test mode), matching the port used by the previous standalone gRPC server.
+Note that the management interface also defaults to `9000`/`9001`, so if you enable both, change one of the two ports
+to avoid a clash.
+
+Unlike the legacy, removed `use-separate-server` mode (which started a dedicated Netty server with its own event
+loops), the separate port mode *reuses the main Vert.x instance*. A second TCP listener is opened, but it shares the
+same event loops and worker thread pool as the HTTP server — there is no additional event loop group or server stack.
+
+The separate gRPC server requires HTTP/2; when no TLS configuration is set it uses HTTP/2 cleartext (h2c).
+
+==== Securing the separate port with TLS
+
+The separate gRPC port is secured by referencing a named configuration in the
+xref:tls-registry-reference.adoc[TLS registry]:
+
+[source,properties]
+----
+quarkus.grpc.server.separate-port.enabled=true
+quarkus.grpc.server.separate-port.port=9000
+quarkus.grpc.server.separate-port.tls-configuration-name=grpc
+
+quarkus.tls.grpc.key-store.jks.path=server-keystore.jks
+quarkus.tls.grpc.key-store.jks.password=secret
+quarkus.tls.grpc.alpn=true
+----
+
+When a TLS configuration name is set, the separate gRPC server is exposed over TLS and negotiates HTTP/2 using ALPN.
+
+[NOTE]
+====
+In *test mode*, the gRPC client ignores `quarkus.grpc.clients.<name>.port` and uses
+`quarkus.grpc.clients.<name>.test-port` instead (falling back to the HTTP test port). When testing against the
+separate gRPC port, configure the client with `test-port`.
+====
+
+==== Security
+
+Securing gRPC services with the HTTP security layer
+(xref:security-authorize-web-endpoints-reference.adoc#standard-security-annotations[annotation-based authorization])
+works the same way whether gRPC is multiplexed on the main HTTP server or exposed on the separate port: the dedicated
+listener reuses the main HTTP server's request pipeline (the request is paused before the authentication and
+authorization filters run and processed on a duplicated context), so authentication, authorization, and security
+events behave identically in both modes.
+
 == Example of Configuration
 
 === Enabling TLS
