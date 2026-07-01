@@ -59,5 +59,14 @@ public interface GrpcServerConfiguration {
          */
         @WithDefault("0.0.0.0")
         String host();
+
+        /**
+         * The name of the TLS configuration (bucket) to use to secure the separate gRPC server.
+         * <p>
+         * The configuration must be registered under the given name in the TLS registry, e.g. via
+         * {@code quarkus.tls.<name>.*} properties. When set, the separate gRPC server is exposed over TLS and
+         * negotiates HTTP/2 using ALPN. When absent, the separate gRPC server uses plain text (HTTP/2 cleartext).
+         */
+        Optional<String> tlsConfigurationName();
     }
 }

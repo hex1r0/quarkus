@@ -40,9 +40,12 @@ import io.quarkus.runtime.LaunchMode;
 import io.quarkus.runtime.RuntimeValue;
 import io.quarkus.runtime.ShutdownContext;
 import io.quarkus.runtime.annotations.Recorder;
+import io.quarkus.tls.TlsConfiguration;
+import io.quarkus.tls.TlsConfigurationRegistry;
 import io.quarkus.value.registry.ValueRegistry;
 import io.quarkus.vertx.http.runtime.QuarkusErrorHandler;
 import io.quarkus.vertx.http.runtime.options.HttpServerCommonHandlers;
+import io.quarkus.vertx.http.runtime.options.HttpServerOptionsUtils;
 import io.quarkus.vertx.http.runtime.security.HttpAuthenticator;
 import io.quarkus.virtual.threads.VirtualThreadsRecorder;
 import io.smallrye.common.vertx.VertxContext;
@@ -53,6 +56,7 @@ import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerConfig;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpVersion;
+import io.vertx.core.net.ServerSSLOptions;
 import io.vertx.ext.web.Route;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
@@ -187,7 +191,10 @@ public class GrpcServerRecorder {
             }
         };
 
-        HttpServer server = vertx.createHttpServer(options).requestHandler(rootHandler);
+        ServerSSLOptions sslOptions = resolveSeparatePortTls(separatePort);
+        HttpServer server = sslOptions != null
+                ? vertx.createHttpServer(options, sslOptions).requestHandler(rootHandler)
+                : vertx.createHttpServer(options).requestHandler(rootHandler);
         server.listen(port, host).onComplete(ar -> {
             if (ar.succeeded()) {
                 LOGGER.infof("gRPC server listening on %s:%d (separate port, sharing the main Vert.x event loops)",
@@ -197,6 +204,25 @@ public class GrpcServerRecorder {
             }
         });
         shutdown.addShutdownTask(() -> server.close());
+    }
+
+    /**
+     * Resolves the {@link ServerSSLOptions} for the separate gRPC server port from the TLS registry, or {@code null}
+     * if no TLS configuration name is set (plain text).
+     */
+    private static ServerSSLOptions resolveSeparatePortTls(GrpcServerConfiguration.SeparatePortConfig separatePort) {
+        if (separatePort.tlsConfigurationName().isEmpty()) {
+            return null;
+        }
+        String name = separatePort.tlsConfigurationName().get();
+        TlsConfigurationRegistry registry = Arc.container().select(TlsConfigurationRegistry.class).get();
+        TlsConfiguration bucket = registry.get(name)
+                .orElseThrow(() -> new IllegalStateException("Unable to find the TLS configuration '" + name
+                        + "' for the separate gRPC server port."));
+        ServerSSLOptions sslOptions = HttpServerOptionsUtils.createSslOptionsFromTlsConfiguration(bucket);
+        // gRPC over TLS negotiates HTTP/2 using ALPN.
+        sslOptions.setUseAlpn(true);
+        return sslOptions;
     }
 
     // TODO -- handle XDS
